@@ -533,6 +533,7 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
+-define(is_byte(X), (((X) band (bnot 16#ff)) =:= 0)).
 
 handle_info({epx_event,Win,Event}, St) when St#state.window =:= Win ->
     case Event of
@@ -548,7 +549,8 @@ handle_info({epx_event,Win,Event}, St) when St#state.window =:= Win ->
 		down  -> {noreply, t_input(St, "\e[1B")};
 		right -> {noreply, t_input(St, "\e[1C")};
 		left  -> {noreply, t_input(St, "\e[1D")};
-		_ when is_integer(Sym) ->
+		_ when ?is_byte(Sym) ->
+		    %% fixme handle unicode
 		    {noreply, t_input(St,[Sym])};
 		_ ->
 		    {noreply, St}
