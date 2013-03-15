@@ -1,0 +1,6 @@
+{application, epx_term,
+ [{description, "Terminal program using epx library"},
+  {vsn, git},
+  {env, []},
+  {applications,[kernel,stdlib,epx,uart]}
+  ]}.
