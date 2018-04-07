@@ -21,7 +21,8 @@
 
 -include_lib("epx/include/epx.hrl").
 
--define(dbg(F,A), ok).
+%% -define(dbg(F,A), ok).
+-define(dbg(F,A), io:format((F),(A))).
 
 %% emacs mode workaround.
 -define(LB,   $[).  
@@ -148,8 +149,8 @@
 -define(CYAN,    6).
 -define(WHITE,   7).
 
--define(DEFAULT_FG_COLOR, ?BLACK).
--define(DEFAULT_BG_COLOR, ?WHITE).
+-define(DEFAULT_FG_COLOR, ?WHITE).
+-define(DEFAULT_BG_COLOR, ?BLACK).
 
 -record(state,
 	{
@@ -220,7 +221,7 @@ start() ->
 shell() ->
     epx:start(),
     spawn_link(fun() ->
-		       Shell = {shell,start,[init]},
+		       Shell = {shell,start,[false,false]},
 		       Proxy = self(),
 		       Flags = [icrnl,onlret,
 				cursor,cursor_underline,uscroll,beep],
@@ -364,7 +365,7 @@ paste(T)               ->
 %%--------------------------------------------------------------------
 init(Flags0) ->
     %% Load a fixed font
-    FontSpec    = font(12),
+    FontSpec    = [{name,"Courier New"},{size,14}],
     {ok,Font}   = epx_font:match(FontSpec),
     {Char_width,Char_height} = epx_font:dimension(Font, "0"),
 
@@ -624,6 +625,7 @@ handle_info({epx_event,Win,Event}, St) when St#state.window =:= Win ->
 	    {stop, normal, St};
 
 	{key_press, Sym, _Mod, _Code} ->
+	    io:format("key ~p\n", [Sym]),
 	    case Sym of
 		up    -> {noreply, t_input(St, "\e[1A")};
 		down  -> {noreply, t_input(St, "\e[1B")};
@@ -648,6 +650,9 @@ handle_info({epx_event,Win,Event}, St) when St#state.window =:= Win ->
 	    {noreply, St};
 
 	{button_release, _Buttons, {_X,_Y,_Z}} ->
+	    {noreply, St};
+	{configure, {_X,_Y,_Width,_Height}} ->
+	    %% fixme scale window according to Width and Height
 	    {noreply, St};
 	Other ->
 	    io:format("Unhandled: epx_event ~p\n", [Other]),
