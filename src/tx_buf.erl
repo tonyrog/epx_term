@@ -9,14 +9,18 @@
 -module(tx_buf).
 
 -export([new/2]).
+-export([position/1, row/1, column/1]).
 -export([add_rows/2, add_cols/2, set_size/3]).
--export([row/2]).
 -export([erase_eol/1, erase_bol/1, erase_line/1, 
 	 erase_eos/1, erase_bos/1, erase_screen/1]).
 -export([commit/1, update/1, scroll/4]).
 -export([goto_row/2, goto_column/2, cursor_pos/3]).
 -export([write_char/3, write_string/3]).
+-export([insert_char/3, insert_string/3]).
+-export([flat_row/2]).
+-export([delete_chars/2]).
 -export([dump/1, dump_row/2]).
+
 
 -import(lists, [duplicate/2, reverse/1, map/2, foldl/3]).
 
@@ -45,6 +49,13 @@ new(Rows, Columns) ->
 	      rr = R
 	    }.
 
+position(#tx_buf { r=R, rr=RR }) ->
+    {R, tx_row:column(RR)}.
+
+row(#tx_buf { r=R }) -> R.
+
+column(#tx_buf { rr=RR }) -> tx_row:column(RR).
+
 dup_row(Buf, I, J, Row) when I =< J ->
     dup_row(setelement(I+1, Buf, Row), I+1, J, Row);
 dup_row(Buf, _, _, _) ->
@@ -61,10 +72,6 @@ move_rows_(SrcBuf, Src, DstBuf, Dst, N) ->
 	       setelement(Dst+1, DstBuf, element(Src+1,SrcBuf)), Dst+1,
 	       N-1).
 
-%% get flat row R as list of [char|attr]
-row(S, R) ->
-    tx_row:as_list(get_row_(S, R)).
-	    
 erase_eol(S) ->
     S#tx_buf { rr = tx_row:erase_eol(S#tx_buf.rr) }.
 
@@ -100,12 +107,6 @@ set_row_(S, R, Row) ->
     Buf = S#tx_buf.buf,
     S#tx_buf { buf = setelement(R+1,Buf,Row) }.
 
-get_row_(S, R) ->
-    if S#tx_buf.r =:= R ->
-	    S#tx_buf.rr;
-       true ->
-	    element(R+1,S#tx_buf.buf)
-    end.
 
 %% preserve current pos
 erase_screen(S) ->
@@ -168,7 +169,7 @@ add_cols(S, N) ->
 	    %% remove N chars from end of each line, 
 	    %% this operation will move the current pos to the
 	    %% beginning of line
-	    BL1 = map(fun(R) -> tx_row:delete(R, N) end, BL0),
+	    BL1 = map(fun(R) -> tx_row:del_eol(R, N) end, BL0),
 	    Buf = list_to_tuple(BL1),
 	    S#tx_buf { buf = Buf };
        true ->
@@ -192,7 +193,7 @@ set_size(S, Rows, Cols) ->
 	 end,
     S5#tx_buf { rows = Rows, columns = Cols }.
 
-%% insert char + attr in current row
+%% write char + attr in current row
 write_char(S, C, Attr) ->
     S#tx_buf { rr = tx_row:write_char(S#tx_buf.rr, C, Attr) }.
 
@@ -202,18 +203,45 @@ write_string(S, [C|Cs], Attr) ->
 write_string(S, [], _Attr) ->
     S.
 
+%% insert char + attr in current row  reversed?
+insert_char(S, C, Attr) ->
+    S#tx_buf { rr = tx_row:insert_char(S#tx_buf.rr, C, Attr) }.
+
+%% insert a string
+insert_string(S, Cs, Attr) ->
+    insert_chars_(S, lists:reverse(Cs), Attr).
+
+insert_chars_(S, [C|Cs], Attr) ->
+    insert_chars_(insert_char(S, C, Attr), Cs, Attr);
+insert_chars_(S, [], _Attr) ->
+    S.
+
+%% delete n characters
+delete_chars(S, N) when is_integer(N) ->
+    S#tx_buf { rr = tx_row:delete_chars(S#tx_buf.rr, N) }.
+
+get_row_(S, R) ->
+    if S#tx_buf.r =:= R ->
+	    S#tx_buf.rr;
+       true ->
+	    element(R+1,S#tx_buf.buf)
+    end.
+
+%% get flat row R as list of [char|attr]
+flat_row(S, R) ->
+    tx_row:as_list(get_row_(S, R)).
 
 %% debug dump the screen
 dump(S) ->
     lists:foreach(
       fun(I) ->
-	      R = row(S, I),
+	      R = flat_row(S, I),
 	      io:format("~3w:", [I]),
 	      emit_line(R)
       end, lists:seq(0, S#tx_buf.rows-1)).
 
 dump_row(S, R) ->
-    emit_line(row(S, R)).
+    emit_line(flat_row(S, R)).
 
 emit_line(Rs) ->
     io:put_chars([map(fun([C|_]) -> C end, Rs),$\n]).

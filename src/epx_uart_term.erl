@@ -9,6 +9,12 @@
 
 -compile(export_all).
 
+start_shell() ->
+    {ok, P} = uart:open("//pty", []),
+    {ok, Device} = uart:getopt(P, device),
+    _Pid = start(Device, []),
+    ok.
+
 start(Device, Options) ->
     spawn_link(?MODULE, init, [Device, Options]).
 

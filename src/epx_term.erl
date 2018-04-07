@@ -21,6 +21,8 @@
 
 -include_lib("epx/include/epx.hrl").
 
+-define(dbg(F,A), ok).
+
 %% emacs mode workaround.
 -define(LB,   $[).  
 -define(RB,   $]).
@@ -134,8 +136,8 @@
 
 -define(S_SPACE, [$\s | ?ATTR_OFF]).
 
--define(DEFAULT_FLAGS, ?CURSOR_ON bor ?CURSOR_UNDERLINE bor 
-	    ?USCROLL bor ?BEEP bor ?AUTOWRAP bor ?ECHO).
+-define(DEFAULT_FLAGS, 
+	[cursor, cursor_underline, uscroll, beep, autowrap, echo]).
 
 -define(BLACK,   0).
 -define(RED,     1).
@@ -151,8 +153,6 @@
 
 -record(state,
 	{
-	  r         = 0,         %% row     (relative to r_top)
-	  c         = 0,         %% column
 	  columns   = 80,        %% number of columns (region)
 	  rows      = 24,        %% number of rows (region)
 	  r_top     = 0,         %% region top
@@ -211,15 +211,84 @@
 %%% API
 %%%===================================================================
 
+%% start a terminal, connected to nothing
 start() ->
     epx:start(),
-    gen_server:start(?MODULE, [], []).
+    gen_server:start(?MODULE, ?DEFAULT_FLAGS, []).
+
+%% erlang shell
+shell() ->
+    epx:start(),
+    spawn_link(fun() ->
+		       Shell = {shell,start,[init]},
+		       Proxy = self(),
+		       Flags = [icrnl,onlret,
+				cursor,cursor_underline,uscroll,beep],
+		       {ok,T} = gen_server:start_link(?MODULE, Flags, []),
+		       connect(T, self()),
+		       U = spawn_link(user_drv, server, [Proxy,Shell]),
+		       shell_proxy(T,U)
+	       end).
+
+shell_proxy(T,U) ->
+    receive
+	{U,{command,[Op|Arg]}} ->
+	    user_command(Op,Arg,T,U);
+	{T,{input,Data}} ->
+	    ?dbg("input: ~p\n", [Data]),
+	    U ! {self(),{data,Data}},
+	    shell_proxy(T,U);
+	Other ->
+	    ?dbg("epx_term: shell got other: ~p\n", [Other]),
+	    shell_proxy(T,U)
+    end.
+
+
+-define(OP_PUTC,0).
+-define(OP_MOVE,1).
+-define(OP_INSC,2).
+-define(OP_DELC,3).
+-define(OP_BEEP,4).
+-define(OP_PUTC_SYNC,5).
+
+user_command(?OP_PUTC,Utf8,T,U) ->
+    ?dbg("putc: ~p\n", [Utf8]),
+    Chars = unicode:characters_to_list(Utf8),
+    send_output(T, Chars),
+    shell_proxy(T,U);
+user_command(?OP_MOVE,[N1,N0],T,U) ->
+    <<Rel:16/signed>> = <<N1,N0>>,
+    ?dbg("move: ~p\n", [Rel]),
+    move(T,0,Rel),
+    shell_proxy(T,U);
+user_command(?OP_INSC,Utf8,T,U) ->
+    ?dbg("insc: ~p\n", [Utf8]),
+    Chars = unicode:characters_to_list(Utf8),
+    send_insert(T, Chars),
+    shell_proxy(T,U);	    
+user_command(?OP_DELC,[N1,N0],T,U) ->
+    <<Del:16/signed>> = <<N1,N0>>,
+    ?dbg("del: ~p\n", [Del]),
+    delete(T,Del),
+    shell_proxy(T,U);
+user_command(?OP_BEEP,[],T,U) ->
+    ?dbg("beep\n", []),
+    beep(T),
+    shell_proxy(T,U);
+user_command(?OP_PUTC_SYNC,Utf8,T,U) ->
+    ?dbg("putc_sync: ~p\n", [Utf8]),
+    Chars = unicode:characters_to_list(Utf8),
+    send_output(T, Chars),
+    shell_proxy(T,U).
 
 send_data(T, Data) -> 
     gen_server:call(T, {data,Data}).
 
 send_output(T, Data) ->
     gen_server:call(T, {output,Data}).
+
+send_insert(T, Data) ->
+    gen_server:call(T, {insert,Data}).
 
 set_flags(T, Flags) ->
     gen_server:call(T, {set_flags,encode_flags(Flags)}).
@@ -237,6 +306,8 @@ goto(T, R, C)          ->
     gen_server:call(T, {set_cursor, R, C}).
 move(T, R, C)          -> 
     gen_server:call(T, {move_cursor, R, C}).
+delete(T, N)          -> 
+    gen_server:call(T, {delete, N}).
 beep(T)                -> 
     gen_server:call(T, beep).
 set_size_rc(T, R, C)   -> 
@@ -291,7 +362,7 @@ paste(T)               ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([]) ->
+init(Flags0) ->
     %% Load a fixed font
     FontSpec    = font(12),
     {ok,Font}   = epx_font:match(FontSpec),
@@ -319,13 +390,11 @@ init([]) ->
     epx:window_attach(Window),
     epx:pixmap_attach(Pixmap),
 
-    Flags = ?DEFAULT_FLAGS bor
+    Flags = encode_flags(Flags0) bor
 	(?DEFAULT_FG_COLOR bsl 5) bor
 	(?DEFAULT_BG_COLOR bsl 8),
 
-    St0 = #state { r           = 0,
-		   c           = 0,
-		   flags       = Flags,
+    St0 = #state { flags       = Flags,
 		   columns     = 80,
 		   rows        = 24,
 		   r_top       = 0,
@@ -343,7 +412,7 @@ init([]) ->
 		   scrn = tx_buf:new(24,80)
 		 },
     St1 = t_cursor_save(St0), %% initial state 
-    St2 = t_update(St1#state { invalid_rect = {0,0,W,H}}),
+    St2 = t_redraw_screen(St1),
     St3 = if ?is_set(?CURSOR_BLINKING, St2#state.flags) ->
 		  start_blinking(St2);
 	     true ->
@@ -374,6 +443,11 @@ handle_call({data,Data},_From,St) ->
 handle_call({output,Data},_From,St) ->
     St1 = apply(St#state.ifun,
 		[map_output(Data, St#state.flags),St]),
+    {reply, ok, St1};
+
+handle_call({insert,Data},_From,St) ->
+    Mapped = map_output(Data, St#state.flags),
+    St1 = t_ins(St, Mapped),
     {reply, ok, St1};
 
 handle_call({set_flags,Fs},_From,St) when is_integer(Fs), Fs >= 0 ->
@@ -421,6 +495,12 @@ handle_call({erase_line, How},_From,St) ->
 handle_call({erase_screen, How},_From,St) ->
     {reply, ok, t_erase_screen(St, How)};
 
+handle_call({delete, N},_From,St) ->
+    R = tx_buf:row(St#state.scrn),
+    St1 = St#state { scrn = tx_buf:delete_chars(St#state.scrn, N) },
+    St2 = t_redraw_line(R, St1),
+    {reply, ok, St2};
+
 handle_call({scroll, How},_From,St) ->
     {reply, ok, t_scroll(St, How)};
 
@@ -456,7 +536,7 @@ handle_call({get,What},_From,St) ->
 	    Color = (St#state.flags band ?ATTR_BG_MASK) bsr 8,
 	    {reply, element(Color+1,St#state.colormap), St};
 	cursor ->
-	    {reply, {St#state.r, St#state.c}, St};
+	    {reply, tx_buf:position(St#state.scrn), St};
 	_ ->
 	    {reply,undefined, St}
     end;
@@ -555,6 +635,9 @@ handle_info({epx_event,Win,Event}, St) when St#state.window =:= Win ->
 		_ ->
 		    {noreply, St}
 	    end;
+	{key_release, _Sym, _Mod, _Code} ->
+	    {noreply, St};
+	    
 	{resize, {W, H, _D}} ->
 	    {noreply, t_set_size_wh(St, W, H)};
 
@@ -691,6 +774,7 @@ e_flag(cursor_underline) -> ?CURSOR_UNDERLINE.
 
 t_invalidate(St, A) ->
     U = epx_rect:union(St#state.invalid_rect,A),
+    %% io:format("invalid_rect: ~w + ~w = ~w\n", [St#state.invalid_rect,A,U]),
     if St#state.invalid_rect =:= undefined ->
 	    self() ! redraw;
        true ->
@@ -702,8 +786,8 @@ t_update(St) ->
     case St#state.invalid_rect of
 	undefined -> 
 	    St;
-	{X,Y,W,H} ->
-	    io:format("Update: ~w,~w,~w,~w\n", [X, Y, W, H]),
+	R={X,Y,W,H} ->
+	    %% io:format("t_update: ~w\n", [R]),
 	    epx:pixmap_draw(St#state.pixmap, St#state.window,
 			    X, Y, X, Y, W, H),
 	    St#state { invalid_rect = undefined }
@@ -717,10 +801,10 @@ t_pixmap_new(St, W, H) ->
 
 %% set terminal size in row and columns
 t_set_size(St, Rows, Cols) ->
-    io:format("t_set_size_rc: rows=~p, cols=~p\n", [Rows, Cols]),
+    ?dbg("t_set_size_rc: rows=~p, cols=~p\n", [Rows, Cols]),
     OH = St#state.t_rows * St#state.char_height,
     OW = St#state.t_columns * St#state.char_width,
-    io:format("t_set_size_rc: oh=~p, ow=~p\n", [OH, OW]),
+    ?dbg("t_set_size_rc: oh=~p, ow=~p\n", [OH, OW]),
     H = (Rows * St#state.char_height),
     W = (Cols * St#state.char_width),
     Pixmap = t_pixmap_new(St, W, H),
@@ -747,7 +831,7 @@ t_set_size(St, Rows, Cols) ->
 
 %% set terminal size in width and height
 t_set_size_wh(St, W, H) ->
-    %% io:format("t_set_wh: ~p, ~p, ~p\n", [W, H, St]),
+    ?dbg("t_set_wh: ~p, ~p, ~p\n", [W, H, St]),
     C = W div St#state.char_width,
     R = H div St#state.char_height,
     t_set_size(St, R, C).
@@ -806,21 +890,22 @@ t_scroll(St, Dir) ->
 %% draw or clear cursor
 %%
 t_cursor(St) ->
+    {R,C} = tx_buf:position(St#state.scrn),
     if
-	St#state.c >= St#state.columns ->
+	C >= St#state.columns ->
 	    St;
 	true ->
 	    Pixmap = St#state.pixmap,
 	    {Y,H} = 
 		if St#state.flags band ?CURSOR_UNDERLINE == 0 ->
-			{ ((St#state.r+St#state.r_top)*St#state.char_height),
+			{ ((R+St#state.r_top)*St#state.char_height),
 			  St#state.char_height };
 		   true ->
-			{ ((St#state.r+St#state.r_top)*St#state.char_height) +
-			  St#state.char_height - 3,
+			{ ((R+St#state.r_top)*St#state.char_height) +
+			      St#state.char_height - 3,
 			  3 }
 		end,
-	    X = (St#state.c * St#state.char_width),
+	    X = (C * St#state.char_width),
 	    W = St#state.char_width,
 	    %% R =  { X, Y, W, H },
 	    Fg = if (St#state.flags band ?ATTR_INVERSE) =/= 0 ->
@@ -834,42 +919,47 @@ t_cursor(St) ->
 
     
 t_erase_line(St, 0) -> %% erase to end of line
-    St1 = t_erase_line(St, St#state.c, St#state.columns-1),
+    C = tx_buf:column(St#state.scrn),
+    St1 = t_erase_line(St, C, St#state.columns-1),
     St1#state { scrn = tx_buf:erase_eol(St#state.scrn) };
 t_erase_line(St, 1) -> %% erase to beginning of line
-    St1 = t_erase_line(St, 0, St#state.c),
+    C = tx_buf:column(St#state.scrn),
+    St1 = t_erase_line(St, 0, C),
     St1#state { scrn = tx_buf:erase_bol(St#state.scrn) };
 t_erase_line(St, 2) -> %% erase entire line
     St1 = t_erase_line(St, 0, St#state.columns-1),
     St1#state { scrn = tx_buf:erase_line(St#state.scrn) }.
 
 t_erase_line(St, From, To) when From =< To ->
+    R = tx_buf:row(St#state.scrn),
     CH = St#state.char_height,
-    Y  = ((St#state.r+St#state.r_top) * CH),
+    Y  = ((R+St#state.r_top) * CH),
     X0 = (From * St#state.char_width),
     X1 = ((To+1) * St#state.char_width),
     W = X1 - X0,
     Pixmap = St#state.pixmap,
-    R = { X0, Y, W, CH },
-    Bg = if (St#state.flags band ?ATTR_INVERSE) == 0 ->
+    Rect = { X0, Y, W, CH },
+    Bg = if (St#state.flags band ?ATTR_INVERSE) =:= 0 ->
 		 St#state.bg_gc;
 	    true ->
 		 St#state.fg_gc
 	 end,
     epx:pixmap_draw_rectangle(Pixmap, Bg, X0, Y, W, CH),
-    t_invalidate(St, R);
+    t_invalidate(St, Rect);
 t_erase_line(St, _From, _To) ->
     St.
 
 t_erase_screen(St, 0) -> %% erase to end of sceen
+    R = tx_buf:row(St#state.scrn),
     St1 = t_erase_line(St,0),
     St2 = t_erase_screen(St1,
-			 (St#state.r+St#state.r_top)+1, 
+			 (R+St#state.r_top)+1, 
 			 St#state.t_rows-1),
     St2#state { scrn = tx_buf:erase_eos(St#state.scrn) };
 t_erase_screen(St, 1) -> %% erase to beginning of screen
+    R = tx_buf:row(St#state.scrn),
     St1 = t_erase_line(St,1),
-    St2 = t_erase_screen(St1, 0, (St#state.r+St#state.r_top)-1),
+    St2 = t_erase_screen(St1, 0, (R+St#state.r_top)-1),
     St2#state { scrn = tx_buf:erase_bos(St#state.scrn) };
 t_erase_screen(St, 2) -> %% erase entire screen
     St1 = t_erase_screen(St, 0, St#state.t_rows-1),
@@ -883,14 +973,14 @@ t_erase_screen(St, From, To) when From =< To ->
     W = X1 - X0,
     H = Y1 - Y0,
     Pixmap = St#state.pixmap,
-    R = { X0, Y0, W, H },
+    Rect = { X0, Y0, W, H },
     Bg = if (St#state.flags band ?ATTR_INVERSE) == 0 ->
 		 St#state.bg_gc;
 	    true ->
 		 St#state.fg_gc
 	 end,
     epx:pixmap_draw_rectangle(Pixmap, Bg, X0, Y0, W, H),
-    t_invalidate(St, R);
+    t_invalidate(St, Rect);
 t_erase_screen(St, _From, _To) ->
     St.
 
@@ -906,7 +996,8 @@ t_print(St, 0) ->  %% print page
     tx_buf:dump(St#state.scrn),                %% debug
     St;
 t_print(St, 1) ->  %% print line
-    tx_buf:dump_row(St#state.scrn, St#state.r),  %% debug
+    R = tx_buf:row(St#state.scrn),
+    tx_buf:dump_row(St#state.scrn, R),  %% debug
     St.
 
 t_cursor_col(St, C0) ->
@@ -914,24 +1005,25 @@ t_cursor_col(St, C0) ->
 	   C0 >= St#state.columns -> St#state.columns - 1;
 	   true -> C0
 	end,
-    St#state { c = C, scrn = tx_buf:goto_column(St#state.scrn, C) }.
+    St#state { scrn = tx_buf:goto_column(St#state.scrn, C) }.
 
 t_cursor_row(St, R0) ->
     R = if R0 < 0 -> 0;
 	   R0 >= St#state.rows -> St#state.rows - 1;
 	   true -> R0
 	end,
-    St#state { r = R, scrn = tx_buf:goto_row(St#state.scrn, R+St#state.r_top) }.
+    St#state { scrn = tx_buf:goto_row(St#state.scrn, R+St#state.r_top) }.
 
 %% set cursor position
 t_cursor_pos(St, R0, C0) ->
     t_cursor_col(t_cursor_row(St,R0), C0).
 
 t_cursor_offs(St, R, C) ->  %% relative cursor movement
-    t_cursor_pos(St, St#state.r + R, St#state.c + C).
+    {R0,C0} = tx_buf:position(St#state.scrn),
+    t_cursor_pos(St, R0 + R, C0 + C).
 
 t_next_line(St) ->
-    R0 = St#state.r + 1,
+    R0 = tx_buf:row(St#state.scrn) + 1,
     if R0 >= St#state.rows ->
 	    t_scroll(St, up);
        true ->
@@ -939,11 +1031,11 @@ t_next_line(St) ->
     end.
 
 t_prev_line(St) ->
-    R0 = St#state.r - 1,
+    R0 = tx_buf:row(St#state.scrn) - 1,
     if R0 < 0 ->
 	    t_scroll(St, down);
        true ->
-	    St#state { r = R0 }
+	    t_cursor_row(St, R0)
     end.
     
 t_attr(St, As) ->
@@ -980,10 +1072,10 @@ t_charset(St, _G, _Set) ->
     St.
 
 t_cursor_save(St) ->
+    {R,C} = tx_buf:position(St#state.scrn),
     St#state { 
       cstate = #cursor_state {
-	r = St#state.r,
-	c = St#state.c,
+	r = R, c = C,
 	char_attr = St#state.flags band ?ATTR_CMASK,
 	char_set = St#state.char_set,
 	r_top    = St#state.r_top,
@@ -1008,7 +1100,7 @@ t_led(St, _Leds) ->
     St.
 
 t_region(St, R1, R2) ->
-    %% io:format("t_region: ~p,~p\n", [R1,R2]),
+    ?dbg("t_region: ~p,~p\n", [R1,R2]),
     if R1 < R2, R1 >= 0, R1 < St#state.t_rows, R2 < St#state.t_rows ->
 	    St1 = St#state { r_top = R1, r_bot = R2,
 			     rows = (R2 - R1 + 1) },
@@ -1029,8 +1121,9 @@ t_identify(St) ->
 t_request(St0, Ps) ->
     foldl(
       fun(6,St) -> %% cursor position
-	      t_send(St, "\e[" ++ integer_to_list(St#state.r+1) ++ ";" ++
-		     integer_to_list(St0#state.c+1) ++ "R");
+	      {R,C} = tx_buf:position(St0#state.scrn),
+	      t_send(St, "\e[" ++ integer_to_list(R+1) ++ ";" ++
+			 integer_to_list(C+1) ++ "R");
 	 (5,St) -> %% status report (3n is not ok)
 	      t_send(St, "\e[0n");
 	 (_,St) ->
@@ -1069,30 +1162,38 @@ t_paste_clipboard(St) ->
 t_delete_selection(St) ->
     St.
 
-
 t_string(St, Text) ->
+    C = tx_buf:column(St#state.scrn),
     if 
-	Text == [] ->
+	Text =:= [] ->
 	    St;
-	St#state.c >= St#state.columns ->
+	C >= St#state.columns ->
 	    t_string(t_cursor_col(t_next_line(St), 0), Text);
        true ->
 	    %% max number of chars to write
-	    N = St#state.columns - St#state.c, 
+	    N = St#state.columns - C,
 	    {Text1,Text2} = split_string(Text, N),
 	    St1 = t_str(St, Text1),
 	    t_string(St1, Text2)
     end.
 
 t_str(St, Str) ->
+    {R,C} = tx_buf:position(St#state.scrn),
     Attr = St#state.flags band ?ATTR_CMASK,
-    St1 = t_draw_string(Str, Attr, St),
+    St1 = t_draw_string(R, C, Str, Attr, St),
     Scrn = tx_buf:write_string(St#state.scrn, Str, Attr),
     St1#state { scrn = Scrn }.
 
 
+t_ins(St, Str) ->
+    Attr = St#state.flags band ?ATTR_CMASK,
+    Scrn = tx_buf:insert_string(St#state.scrn, Str, Attr),
+    St1 = St#state { scrn = Scrn },
+    R = tx_buf:row(St1#state.scrn),
+    t_redraw_line(R, St1).
 
-%% redraw all sccharacters
+
+%% redraw all 
 t_redraw_screen(St) ->
     St1 = lists:foldl(
 	    fun(R,St0) ->
@@ -1102,31 +1203,29 @@ t_redraw_screen(St) ->
     H = St1#state.char_height* St#state.t_rows,
     t_invalidate(St1, {0,0,W,H}).
 
-%% redraw a line (r,c are update)
+
 t_redraw_line(R, St0) ->
-    %% Flags = St0#state.flags,
-    St1 = St0#state { c = 0, r = R },
-    Row = tx_buf:row(St1#state.scrn, R),
-    t_redraw_line(Row, 0, [], St1).
+    Row = tx_buf:flat_row(St0#state.scrn, R),
+    t_redraw_line(Row, 0, [], R, 0, St0).
 
-t_redraw_line([[C|Attr]|Cs], Attr, Acc, St) ->
-    t_redraw_line(Cs, Attr, [C|Acc], St);
-t_redraw_line([[C|NewAttr]|Cs], Attr, Acc, St) ->
-    St1 = t_redraw_chars(reverse(Acc), Attr, St),
-    t_redraw_line(Cs, NewAttr, [C], St1);
-t_redraw_line([], Attr, Acc, St) ->
-    t_redraw_chars(reverse(Acc), Attr, St).
+t_redraw_line([[C|Attr]|Cs], Attr, Acc, Ri, Cj, St) ->
+    t_redraw_line(Cs, Attr, [C|Acc], Ri, Cj, St);
+t_redraw_line([[C|NewAttr]|Cs], Attr, Acc, Ri, Cj, St) ->
+    St1 = t_redraw_chars(Ri, Cj, reverse(Acc), Attr, St),
+    t_redraw_line(Cs, NewAttr, [C], Ri, Cj+length(Acc), St1);
+t_redraw_line([], Attr, Acc, Ri, Cj, St) ->
+    t_redraw_chars(Ri,Cj,reverse(Acc), Attr, St).
 
-t_redraw_chars([], _Attr, St) ->
+t_redraw_chars(_Ri,_Cj,[],_Attr,St) ->
     St;
-t_redraw_chars(Cs, Attr, St) ->
-    t_draw_string(Cs, Attr, St).
+t_redraw_chars(Ri,Cj,Cs,Attr,St) ->
+    t_draw_string(Ri,Cj,Cs,Attr,St).
 
-t_draw_string(Cs, Attr, St) ->
+t_draw_string(R, C, Cs, Attr, St) ->
     N = length(Cs),
     %% F = St#state.font,
-    Y = (St#state.r * St#state.char_height),
-    X = (St#state.c * St#state.char_width),
+    Y = (R * St#state.char_height),
+    X = (C * St#state.char_width),
     W = N*St#state.char_width,
     H = St#state.char_height,
     FColor = (Attr band ?ATTR_FG_MASK) bsr 5,
@@ -1150,8 +1249,7 @@ t_draw_string(Cs, Attr, St) ->
        true ->
 	    epx:pixmap_draw_line(Pixmap, Fg, X, Y0, X+W, Y0)
     end,
-    St1 = St#state { c = St#state.c + N },
-    t_invalidate(St1, { X, Y, W, H }).
+    t_invalidate(St, { X, Y, W, H }).
 
 
 %% make sure alpha=0 for font color
@@ -1165,7 +1263,7 @@ t_set_color(Gc, Color) ->
 
 
 t_send(St, String) ->
-    %% io:format("t_send ~p\n", [String]),
+    ?dbg("t_send ~p\n", [String]),
     send_connected(St#state.connected, {self(),{input,String}}),
     send_waiter(St#state.wait, St#state.input++String, St).
 
@@ -1297,10 +1395,10 @@ vt100_ctl(?FF,  Cs, St) -> vt100_emu(Cs, t_next_line(St));
 vt100_ctl(?VF,  Cs, St) -> vt100_emu(Cs, t_next_line(St));
 vt100_ctl(?CR,  Cs, St) -> vt100_emu(Cs, t_cursor_col(St, 0));
 vt100_ctl(?TAB,  Cs, St) ->
-    C0 = St#state.c, %% fix me use tab list 
+    C0 = tx_buf:column(St#state.scrn),  %% fix me use tab list 
     vt100_emu(Cs, t_cursor_col(St, C0 + (8 - (C0 rem 8))));
 vt100_ctl(?BS, Cs, St) ->
-    C0 = St#state.c,
+    C0 = tx_buf:column(St#state.scrn),
     if C0 =< 0 ->
 	    vt100_emu(Cs, St);
        St#state.flags band ?ECHOE == 0 ->
@@ -1432,10 +1530,10 @@ vt52_ctl($\f,  Cs, St) -> vt52_emu(Cs, t_next_line(St));
 vt52_ctl($\v,  Cs, St) -> vt52_emu(Cs, t_next_line(St));
 vt52_ctl($\r,  Cs, St) -> vt52_emu(Cs, t_cursor_col(St, 0));
 vt52_ctl($\t,  Cs, St) ->
-    C0 = St#state.c, %% fix me use tab list 
+    C0 = tx_buf:column(St#state.scrn),  %% fix me use tab list 
     vt52_emu(Cs, t_cursor_col(St, C0 + (8 - (C0 rem 8))));
 vt52_ctl($\b, Cs, St) ->
-    C0 = St#state.c,
+    C0 = tx_buf:column(St#state.scrn),
     if C0 =< 0 ->
 	    vt52_emu(Cs, St);
        St#state.flags band ?ECHOE == 0 ->
